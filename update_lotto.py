@@ -1,79 +1,106 @@
 import os
+import re
+import glob
 import json
 import random
-import time
 import requests
 import pandas as pd
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 from collections import Counter
 
 CSV_FILE = "lotto_history.csv"
 PICKS_FILE = "weekly_picks.json"
-API_URL = "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={}"
-
-# 크롬 브라우저로 위장하는 헤더 추가
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Referer": "https://www.dhlottery.co.kr/",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-session = requests.Session()
-session.headers.update(HEADERS)
+
+def calc_draw_date(drw_no):
+    first_draw = datetime(2002, 12, 7)
+    return (first_draw + timedelta(days=(int(drw_no) - 1) * 7)).strftime("%Y-%m-%d")
 
 
-def fetch_draw(drw_no):
+def init_from_excel():
+    excel_files = glob.glob("*.xlsx") + glob.glob("*.xls")
+    if not excel_files:
+        print("엑셀 파일을 찾을 수 없습니다.")
+        return pd.DataFrame()
+
+    target_file = excel_files[0]
+    print(f"엑셀 파일 읽는 중: {target_file}")
+
     try:
-        res = session.get(API_URL.format(drw_no), timeout=10)
-        if res.status_code != 200:
-            print(f"{drw_no}회차 HTTP 오류: {res.status_code}")
+        raw_df = pd.read_excel(target_file, header=None)
+    except Exception:
+        raw_df = pd.read_html(target_file)[0]
+
+    rows = []
+    for _, row in raw_df.iterrows():
+        if len(row) < 9:
+            continue
+        try:
+            drw_no = int(float(str(row.iloc[1]).strip()))
+            nums = [int(float(str(row.iloc[i]).strip())) for i in range(2, 9)]
+            if 1 <= drw_no <= 5000 and all(1 <= n <= 45 for n in nums):
+                rows.append({
+                    "drwNo": drw_no,
+                    "drwNoDate": calc_draw_date(drw_no),
+                    "n1": nums[0], "n2": nums[1], "n3": nums[2],
+                    "n4": nums[3], "n5": nums[4], "n6": nums[5],
+                    "bonus": nums[6],
+                })
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["drwNo"]).sort_values("drwNo").reset_index(drop=True)
+    df.to_csv(CSV_FILE, index=False)
+    print(f"엑셀에서 총 {len(df)}개 회차 초기 적재 완료 (최신: {df['drwNo'].max()}회)")
+    return df
+
+
+def fetch_latest_from_naver():
+    url = "https://search.naver.com/search.naver?where=nexearch&query=로또+당첨번호"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        match = re.search(r"(\d+)회\s*\((\d{4}\.\d{2}\.\d{2})\.?\)", text)
+        if not match:
             return None
-        data = res.json()
-        if data.get("returnValue") == "success":
+
+        drw_no = int(match.group(1))
+        drw_date = match.group(2).replace(".", "-")
+        win_balls = [int(b.get_text(strip=True)) for b in soup.select(".winning_number .ball")]
+        bonus_balls = [int(b.get_text(strip=True)) for b in soup.select(".bonus_number .ball")]
+
+        if len(win_balls) == 6 and len(bonus_balls) == 1:
             return {
-                "drwNo": data["drwNo"],
-                "drwNoDate": data["drwNoDate"],
-                "n1": data["drwtNo1"],
-                "n2": data["drwtNo2"],
-                "n3": data["drwtNo3"],
-                "n4": data["drwtNo4"],
-                "n5": data["drwtNo5"],
-                "n6": data["drwtNo6"],
-                "bonus": data["bnusNo"],
+                "drwNo": drw_no, "drwNoDate": drw_date,
+                "n1": win_balls[0], "n2": win_balls[1], "n3": win_balls[2],
+                "n4": win_balls[3], "n5": win_balls[4], "n6": win_balls[5],
+                "bonus": bonus_balls[0],
             }
     except Exception as e:
-        print(f"{drw_no}회차 조회 오류: {e}")
-        try:
-            print("응답 일부:", res.text[:150].replace("\n", " "))
-        except Exception:
-            pass
+        print(f"네이버 조회 오류: {e}")
     return None
 
 
 def update_history():
-    if os.path.exists(CSV_FILE):
-        df = pd.read_csv(CSV_FILE)
-        next_drw = int(df["drwNo"].max()) + 1
-    else:
-        df = pd.DataFrame(
-            columns=["drwNo", "drwNoDate", "n1", "n2", "n3", "n4", "n5", "n6", "bonus"]
-        )
-        next_drw = 1
+    df = pd.read_csv(CSV_FILE) if os.path.exists(CSV_FILE) else init_from_excel()
+    if df.empty:
+        return df
 
-    new_rows = []
-    while True:
-        row = fetch_draw(next_drw)
-        if row is None:
-            break
-        new_rows.append(row)
-        next_drw += 1
-        time.sleep(0.1)
+    latest_saved = int(df["drwNo"].max())
+    naver_row = fetch_latest_from_naver()
 
-    if new_rows:
-        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    if naver_row and naver_row["drwNo"] > latest_saved:
+        df = pd.concat([df, pd.DataFrame([naver_row])], ignore_index=True)
+        df = df.drop_duplicates(subset=["drwNo"]).sort_values("drwNo").reset_index(drop=True)
         df.to_csv(CSV_FILE, index=False)
-        print(f"{len(new_rows)}개 회차 업데이트 완료 (최신: {df['drwNo'].max()}회)")
+        print(f"네이버에서 최신 {naver_row['drwNo']}회차 업데이트 완료!")
     else:
-        print("이미 최신 회차입니다.")
+        print(f"현재 최신 회차 유지 중 ({latest_saved}회)")
     return df
 
 
@@ -81,8 +108,7 @@ def generate_weekly_picks(df):
     num_cols = ["n1", "n2", "n3", "n4", "n5", "n6"]
 
     # 1~3세트: 역대 최다 출현 상위 15개 중 가중치 추출
-    all_nums = df[num_cols].values.flatten()
-    total_counts = Counter(all_nums)
+    total_counts = Counter(df[num_cols].values.flatten())
     top_15 = total_counts.most_common(15)
     top_nums = [num for num, _ in top_15]
     top_weights = [cnt for _, cnt in top_15]
@@ -97,10 +123,8 @@ def generate_weekly_picks(df):
             sets_hot.append(sorted_pick)
 
     # 4~5세트: 최근 20회차 미출현 번호 기반 추출
-    recent_20 = df.tail(20)
-    recent_counts = Counter(recent_20[num_cols].values.flatten())
+    recent_counts = Counter(df.tail(20)[num_cols].values.flatten())
     cold_nums = [n for n in range(1, 46) if recent_counts[n] == 0]
-
     pool_cold = list(cold_nums)
     if len(pool_cold) < 8:
         least_recent = sorted(
@@ -134,12 +158,10 @@ def generate_weekly_picks(df):
 
     with open(PICKS_FILE, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-
     return result
 
 
 def send_kakao_memo(picks):
-    """카카오톡 나에게 보내기 발송"""
     rest_api_key = os.environ.get("KAKAO_REST_API_KEY")
     refresh_token = os.environ.get("KAKAO_REFRESH_TOKEN")
     dashboard_url = os.environ.get("DASHBOARD_URL") or "http://localhost:3000"
