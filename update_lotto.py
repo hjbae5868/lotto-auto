@@ -10,10 +10,23 @@ CSV_FILE = "lotto_history.csv"
 PICKS_FILE = "weekly_picks.json"
 API_URL = "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={}"
 
+# 크롬 브라우저로 위장하는 헤더 추가
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://www.dhlottery.co.kr/",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+}
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
 
 def fetch_draw(drw_no):
     try:
-        res = requests.get(API_URL.format(drw_no), timeout=5)
+        res = session.get(API_URL.format(drw_no), timeout=10)
+        if res.status_code != 200:
+            print(f"{drw_no}회차 HTTP 오류: {res.status_code}")
+            return None
         data = res.json()
         if data.get("returnValue") == "success":
             return {
@@ -29,6 +42,10 @@ def fetch_draw(drw_no):
             }
     except Exception as e:
         print(f"{drw_no}회차 조회 오류: {e}")
+        try:
+            print("응답 일부:", res.text[:150].replace("\n", " "))
+        except Exception:
+            pass
     return None
 
 
